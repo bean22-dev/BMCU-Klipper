@@ -11,7 +11,7 @@ uninstall
 curl -fsSL https://raw.githubusercontent.com/jarczakpawel/BMCU-Klipper/main/install.sh | sh -s -- --uninstall
 ```
 
-Once the installation prompts are complete, open the BMCU PANEL webpage:
+Once the installation prompts are complete, open the BMCU panel webpage:
 http://PRINTER_IP:8291/
 
 # Connection
@@ -19,10 +19,10 @@ http://PRINTER_IP:8291/
 - Connect the RX, TX, and GND pins of the USB-TTL module to the TX, RX, and GND pins of the BMCU.
 
 
-# FLASH FIREWARE
+# FLASH Fireware
 - Select Flashing Mode and fireware
 <p align="left">
-  <img src="./Image/flash1.png" width="1060" height="660">
+  <img src="./Image/flash1.png" width="1060" height="700">
 </p>
 
 - In the pop-up window, check all options and then enable Flash.
@@ -34,7 +34,7 @@ Once all BMCUs have been flashed, connect all the USB-TTL modules back to the Ra
 # Calibration
 - Click the calibration button to start the automatic 4-channel BMCU calibration.
 <p align="left">
-  <img src="./Image/calibrate.png" width="1060" height="660">
+  <img src="./Image/calibrate.png" width="1060" height="700">
 </p>
 
 - When a channel's yellow light flashes, press down on the channel, hold for 1 second, and then release.
@@ -43,13 +43,13 @@ Once all BMCUs have been flashed, connect all the USB-TTL modules back to the Ra
 # Panel
 ## Generic toolhead integration
 <p align="left">
-  <img src="./Image/general.png" width="1060" height="660">
+  <img src="./Image/general.png" width="1060" height="700">
 </p>
 
 
 ## Channel Setting
 <p align="left">
-  <img src="./Image/channel1.png" width="1060" height="660">
+  <img src="./Image/channel1.png" width="1060" height="700">
 </p>
 
 <p align="left">
@@ -59,7 +59,7 @@ Once all BMCUs have been flashed, connect all the USB-TTL modules back to the Ra
 
 ## Routing
 <p align="left">
-  <img src="./Image/route.png" width="1060" height="660">
+  <img src="./Image/route.png" width="1060" height="700">
 </p>
 
 
