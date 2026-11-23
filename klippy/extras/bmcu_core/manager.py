@@ -88,6 +88,16 @@ class BMCUManager(object):
         if len(self._u1_planner_socket.encode('utf-8')) >= 100:
             raise config.error('transport_socket_dir is too long for U1 planner')
         self.connect_settle_time = finite_config_float('connect_settle_time', 1.5, minval=0.1, maxval=10.0)
+        # Half-duplex RS485: post-TX reply window + listen-before-talk.
+        # MCU RX→TX turnaround is firmware compile-time; STATUS is host-polled.
+        self.tx_turnaround_ms = finite_config_float(
+            'tx_turnaround_ms', 10.0, minval=0.0, maxval=50.0)
+        self.bus_idle_ms = finite_config_float(
+            'bus_idle_ms', 5.0, minval=0.0, maxval=50.0)
+        self.status_poll_interval = finite_config_float(
+            'status_poll_interval', 1.0, minval=0.0, maxval=30.0)
+        self.link_offline_grace_s = finite_config_float(
+            'link_offline_grace_s', 5.0, minval=0.0, maxval=60.0)
         self.sidecar_status_interval = finite_config_float(
             'sidecar_status_interval', 1.00, minval=0.05, maxval=10.0)
         self.reconnect_interval = finite_config_float('reconnect_interval', 1.0, minval=0.1, maxval=60.0)
@@ -3693,6 +3703,67 @@ class BMCUManager(object):
                     elapsed_ms, self.callback_warning_ms)
         self._status_build_max_ms = max(self._status_build_max_ms, elapsed_ms)
 
+    def _transport_socket_online(self, device):
+        path = str(getattr(device, 'socket_path', '') or '')
+        if not path:
+            return False
+        try:
+            if os.path.islink(path):
+                return False
+            return stat.S_ISSOCK(os.stat(path).st_mode)
+        except OSError:
+            return False
+
+    def _transport_status_file_path(self, device):
+        socket_path = str(getattr(device, 'socket_path', '') or '')
+        name = str(getattr(device, 'name', '') or '')
+        if not socket_path or not name:
+            return ''
+        return os.path.join(os.path.dirname(socket_path), '%s.status.json' % name)
+
+    def _transport_updated_at(self, device):
+        # Keep last good stamp so status pushes never blank Live sensor age.
+        previous = float(getattr(device, '_last_transport_updated_at', 0.0) or 0.0)
+        path = self._transport_status_file_path(device)
+        if not path:
+            return previous
+        try:
+            if os.path.islink(path):
+                return previous
+            info = os.stat(path)
+            if info.st_size <= 0 or info.st_size > 1024 * 1024:
+                return previous
+            with open(path, 'r') as stream:
+                payload = json.load(stream)
+            if not isinstance(payload, dict):
+                return previous
+            payload_name = str(payload.get('name', '') or '')
+            if payload_name and payload_name != device.name:
+                return previous
+            updated_at = float(payload.get('updated_at', 0.0) or 0.0)
+            if updated_at > 0.0:
+                device._last_transport_updated_at = updated_at
+                return updated_at
+        except (OSError, ValueError, TypeError):
+            pass
+        return previous
+
+    def _transport_diag_fields(self, device):
+        socket_online = self._transport_socket_online(device)
+        # Sidecar process is up if Klipper holds IPC, or the Unix socket is bound.
+        process_online = bool(getattr(device, 'ipc_connected', False)) or socket_online
+        return {
+            'transport_online': bool(getattr(device, 'transport_online', False)),
+            'transport_process_online': process_online,
+            'transport_socket_online': socket_online,
+            'transport_generation': int(
+                getattr(device, 'transport_generation', 0) or 0),
+            'transport_updated_at': self._transport_updated_at(device),
+            'transport_port': str(getattr(device, 'port', '') or ''),
+            'transport_session_id': int(
+                device.status.get('session_id', 0) or 0),
+        }
+
     def _build_status(self, now):
         devices = []
         for device_index, device in enumerate(self.devices):
@@ -3748,7 +3819,7 @@ class BMCUManager(object):
                 })
                 metadata['state'] = self._channel_state_name(device, channel, metadata)
                 channels.append(metadata)
-            devices.append({
+            device_status = {
                 'name': device.name, 'uid': device.uid, 'port': device.port,
                 'transport_socket': device.socket_path,
                 'connected': device.connected, 'ready': device.ready,
@@ -3802,7 +3873,9 @@ class BMCUManager(object):
                     'pull_speed_end_mms': device.motion_config.get(protocol.CONFIG_PULL_SPEED_END_MMS),
                 },
                 'channels': channels,
-            })
+            }
+            device_status.update(self._transport_diag_fields(device))
+            devices.append(device_status)
         endpoint_status = {}
         for name, endpoint in self.endpoints.items():
             values = _snapshot_value(self.state.data.get('endpoints', {}).get(name, {}))
@@ -8265,25 +8338,59 @@ class BMCUManager(object):
         if not arrival_evidence.get('sensor_triggered'):
             raise BMCUError(
                 'U1_LOAD_PRESSURE_NOT_READY: no Head entry-sensor confirmation')
+        target_pct = self._u1_load_pressure_pct(device)
         try:
-            buffer_pct = int(device.status['buffer_pct'][channel])
-            motion = int(device.status['motion'][channel])
-        except (TypeError, ValueError, KeyError, IndexError):
-            buffer_pct = -1
-            motion = -1
+            timeout_s = max(5.0, float(configured_timeout))
+        except (TypeError, ValueError, OverflowError):
+            timeout_s = 45.0
+        if not math.isfinite(timeout_s):
+            timeout_s = 45.0
+        timeout_s = min(120.0, timeout_s)
+        deadline = self.reactor.monotonic() + timeout_s
+        next_poll = 0.0
+        buffer_pct = -1
+        motion = -1
+        # BMCU is already in BEFORE_ON_USE (push/hold). Do not extrude yet:
+        # wait until buffer builds to the load pressure target, then bite/capture.
+        logging.info(
+            'BMCU Snapmaker %s waiting for pre-bite pressure hold: '
+            'target=%.0f%% timeout=%.1fs (extruder idle)',
+            endpoint.name, target_pct, timeout_s)
+        while True:
+            try:
+                buffer_pct = int(device.status['buffer_pct'][channel])
+                motion = int(device.status['motion'][channel])
+            except (TypeError, ValueError, KeyError, IndexError):
+                buffer_pct = -1
+                motion = -1
+            if buffer_pct >= int(round(target_pct)):
+                break
+            now = self.reactor.monotonic()
+            if now >= deadline:
+                raise BMCUError(
+                    'U1_LOAD_PRESSURE_TIMEOUT: buffer stayed at %d%% '
+                    '(target %.0f%%) before toolhead bite' %
+                    (buffer_pct, target_pct))
+            if now >= next_poll:
+                try:
+                    device.send(protocol.MSG_GET_STATUS)
+                except Exception:
+                    pass
+                next_poll = now + 0.15
+            self.reactor.pause(min(deadline, now + 0.100))
         evidence = {
             'arrival_motion': bool(arrival_evidence.get('sensor_triggered')),
             'arrival_contact': bool(arrival_evidence.get('controller_contact')),
             'buffer_pct': buffer_pct,
-            'configured_target_pct': self._u1_load_pressure_pct(device),
+            'configured_target_pct': target_pct,
             'motion': motion,
             'firmware_owned': True,
-            'host_waited': False,
+            'host_waited': True,
         }
         logging.info(
-            'BMCU Snapmaker %s pressure control handed to firmware: '
+            'BMCU Snapmaker %s pre-bite pressure ready: '
             'buffer=%d%% target=%.0f%% motion=%d',
-            endpoint.name, buffer_pct, evidence['configured_target_pct'], motion)
+            endpoint.name, buffer_pct, target_pct, motion)
         return evidence
 
     def _start_endpoint_arrival_operation(

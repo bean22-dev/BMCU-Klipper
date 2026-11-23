@@ -88,12 +88,18 @@ class TransportDaemon(object):
         self.next_handshake_action = 0.0
         self.heartbeat_cmd = 0
         self.heartbeat_sent_at = 0.0
+        self.status_poll_cmd = 0
+        self.status_poll_sent_at = 0.0
+        self.last_status_poll_at = 0.0
         self.serial_lease_fd = None
         self.serial_lease_path = ''
         self.last_serial_rx = 0.0
         self.last_serial_tx = 0.0
+        self.serial_tx_holdoff_until = 0.0
         self.last_keepalive = 0.0
         self.serial_released = False
+        self.soft_recover_until = 0.0
+        self.soft_recover_reason = ''
         self.pending_local_hello = []
         self.pending_local_snapshot = []
         self.latest_status_dict = None
@@ -552,7 +558,9 @@ class TransportDaemon(object):
             self.current_port = port
             self.serial_decoder = protocol.StreamDecoder()
             self.serial_tx[:] = b''
-            self.serial_generation = (self.serial_generation + 1) & 0xffffffff
+            # Soft recover keeps generation so Klipper does not drop ready.
+            if not self.soft_recover_until:
+                self.serial_generation = (self.serial_generation + 1) & 0xffffffff
             self.seq = 1
             self.internal_pending.clear()
             self.session_id = 0
@@ -561,20 +569,48 @@ class TransportDaemon(object):
             self.handshake_phase = 'idle'
             self.heartbeat_cmd = 0
             self.heartbeat_sent_at = 0.0
+            self.status_poll_cmd = 0
+            self.status_poll_sent_at = 0.0
+            self.last_status_poll_at = 0.0
             now = time.monotonic()
             self.last_serial_rx = now
             self.last_serial_tx = now
+            self.serial_tx_holdoff_until = 0.0
             self.serial_settle_until = now + self.args.connect_settle
             self.handshake_started_at = self.serial_settle_until
             self.next_handshake_action = self.serial_settle_until
-            logging.info('opened %s for %s', port, self.args.name)
+            logging.info('opened %s for %s%s', port, self.args.name,
+                         ' (soft recover)' if self.soft_recover_until else '')
             self._write_status_file(force=True)
             return
         if last_error is not None:
             raise RuntimeError('no serial candidate could be opened: %s' % last_error)
 
-    def _close_serial(self, reason, notify=True):
+    def _begin_soft_recover(self, reason):
+        """Reopen serial without telling Klipper the link is offline yet."""
+        if self.soft_recover_until:
+            return
+        grace = float(getattr(self.args, 'link_offline_grace_s', 5.0) or 0.0)
+        if grace <= 0.0:
+            self._close_serial(reason, notify=True)
+            return
+        self.soft_recover_reason = str(reason or 'serial soft recover')
+        self.soft_recover_until = time.monotonic() + grace
+        logging.warning('serial soft recover for %.1fs: %s',
+                        grace, self.soft_recover_reason)
+        self._close_serial(self.soft_recover_reason, notify=False)
+
+    def _clear_soft_recover(self):
+        self.soft_recover_until = 0.0
+        self.soft_recover_reason = ''
+
+    def _close_serial(self, reason, notify=True, force_notify=False):
         was_open = self.serial is not None or self.session_ready
+        # While soft-recovering, suppress offline notify so Dashboard/Diagnostics
+        # do not flicker unless grace expires.
+        if (notify and not force_notify and self.soft_recover_until and
+                time.monotonic() < self.soft_recover_until):
+            notify = False
         if self.serial is not None:
             try:
                 self.serial.close()
@@ -584,6 +620,7 @@ class TransportDaemon(object):
         self._release_serial_lease()
         self.current_port = ''
         self.serial_tx[:] = b''
+        self.serial_tx_holdoff_until = 0.0
         self.serial_decoder = protocol.StreamDecoder()
         self.internal_pending.clear()
         self.external_pending.clear()
@@ -596,6 +633,9 @@ class TransportDaemon(object):
         self.next_handshake_action = 0.0
         self.heartbeat_cmd = 0
         self.heartbeat_sent_at = 0.0
+        self.status_poll_cmd = 0
+        self.status_poll_sent_at = 0.0
+        self.last_status_poll_at = 0.0
         self.session_id = 0
         self.runtime_uid = ''
         self.latest_hello = None
@@ -605,11 +645,15 @@ class TransportDaemon(object):
         self.pending_local_hello[:] = []
         self.pending_local_snapshot[:] = []
         if not self.serial_released:
-            self.next_serial_connect = time.monotonic() + self.args.reconnect
-        self.latest_status_dict = None
+            # Soft recover retries immediately; hard offline uses reconnect delay.
+            delay = 0.05 if self.soft_recover_until else self.args.reconnect
+            self.next_serial_connect = time.monotonic() + delay
+        # Keep latest_status_dict across soft-recover so Loaded routes does not
+        # briefly drop 1→0 while the serial link is reopened.
         self.last_semantic_status = None
         self._write_status_file(force=True)
         if notify and was_open:
+            self._clear_soft_recover()
             logging.warning('serial offline: %s', reason)
             self._queue_link(False, reason)
 
@@ -633,9 +677,16 @@ class TransportDaemon(object):
             self.last_good_port = self.current_port
         self.heartbeat_cmd = 0
         self.heartbeat_sent_at = 0.0
+        self.status_poll_cmd = 0
+        self.status_poll_sent_at = 0.0
+        self.last_status_poll_at = time.monotonic()
+        recovered = bool(self.soft_recover_until)
+        self._clear_soft_recover()
         self._queue_internal(protocol.MSG_UPDATE_CANCEL, b'', 'resume_update')
         self._queue_internal(protocol.MSG_GET_SNAPSHOT, b'', 'snapshot')
         self._queue_link(True)
+        if recovered:
+            logging.info('serial soft recover succeeded for %s', self.args.name)
         self._write_status_file(force=True)
         pending = list(self.pending_local_hello)
         self.pending_local_hello[:] = []
@@ -822,6 +873,11 @@ class TransportDaemon(object):
             self.heartbeat_cmd = 0
             self.heartbeat_sent_at = 0.0
             return
+        if purpose == 'status_poll' and msg_type == protocol.MSG_STATUS:
+            self.internal_pending.pop(cmd_id, None)
+            self.status_poll_cmd = 0
+            self.status_poll_sent_at = 0.0
+            # Fall through to shared MSG_STATUS client publish path.
         if purpose == 'orphan_abort' and msg_type in (
                 protocol.MSG_ACK, protocol.MSG_ERROR):
             self.internal_pending.pop(cmd_id, None)
@@ -971,6 +1027,8 @@ class TransportDaemon(object):
         data = os.read(self.serial.fileno(), 4096)
         if not data:
             raise OSError(errno.EIO, 'serial EOF')
+        # Any wire activity counts for listen-before-talk (mid-frame STATUS too).
+        self.last_serial_rx = time.monotonic()
         previous = self.serial_decoder.errors
         packets = self.serial_decoder.feed(data)
         if self.serial_decoder.incompatible_version is not None:
@@ -989,8 +1047,22 @@ class TransportDaemon(object):
         for message in self.client_decoder.feed(data):
             self._handle_client_message(message)
 
+    def _serial_can_tx(self, now=None):
+        """Half-duplex gate: post-TX reply window + listen-before-talk."""
+        if now is None:
+            now = time.monotonic()
+        if now < self.serial_tx_holdoff_until:
+            return False
+        idle_ms = float(getattr(self.args, 'bus_idle_ms', 0.0) or 0.0)
+        if idle_ms > 0.0 and (now - self.last_serial_rx) < (idle_ms / 1000.0):
+            return False
+        return True
+
     def _flush_serial(self):
         if not self.serial_tx:
+            return
+        now = time.monotonic()
+        if not self._serial_can_tx(now):
             return
         try:
             written = os.write(self.serial.fileno(), self.serial_tx[:4096])
@@ -1000,6 +1072,16 @@ class TransportDaemon(object):
             raise
         if written:
             del self.serial_tx[:written]
+            if not self.serial_tx:
+                # Reply window: keep bus free for MCU immediate responses.
+                turnaround_ms = float(getattr(self.args, 'tx_turnaround_ms', 0.0) or 0.0)
+                if turnaround_ms > 0.0:
+                    try:
+                        termios.tcdrain(self.serial.fileno())
+                    except Exception:
+                        pass
+                    self.serial_tx_holdoff_until = time.monotonic() + (
+                        turnaround_ms / 1000.0)
 
     def _flush_client(self):
         if self.client is None or not self.client_tx:
@@ -1046,16 +1128,49 @@ class TransportDaemon(object):
                     self.heartbeat_cmd = 0
                     self.heartbeat_sent_at = 0.0
 
-                if (now - self.last_serial_tx >= self.args.heartbeat and
-                        not self.heartbeat_cmd):
+                status_poll_retry = max(0.5, min(
+                    float(getattr(self.args, 'status_poll_interval', 0.5) or 0.5) * 2.0,
+                    self.args.connection_timeout * 0.25))
+                if (self.status_poll_cmd and self.status_poll_sent_at and
+                        now - self.status_poll_sent_at >= status_poll_retry):
+                    self.internal_pending.pop(self.status_poll_cmd, None)
+                    self.status_poll_cmd = 0
+                    self.status_poll_sent_at = 0.0
+
+                heartbeat_due = (now - self.last_serial_tx >= self.args.heartbeat and
+                                 not self.heartbeat_cmd)
+                if heartbeat_due:
                     try:
                         self.heartbeat_cmd = self._queue_internal(
                             protocol.MSG_PING, b'B', 'heartbeat')
                         self.heartbeat_sent_at = now
                     except Exception as exc:
                         self._close_serial(str(exc))
-                if now - self.last_serial_rx > self.args.connection_timeout:
-                    self._close_serial('receive timeout after heartbeat retries')
+                else:
+                    # Host-polled STATUS: only when TX queue empty and bus free,
+                    # so it never jumps ahead of Host command traffic.
+                    poll_interval = float(
+                        getattr(self.args, 'status_poll_interval', 0.5) or 0.0)
+                    if (poll_interval > 0.0 and
+                            not self.status_poll_cmd and
+                            not self.serial_tx and
+                            self._serial_can_tx(now) and
+                            now - self.last_status_poll_at >= poll_interval):
+                        try:
+                            self.status_poll_cmd = self._queue_internal(
+                                protocol.MSG_GET_STATUS, b'', 'status_poll')
+                            self.status_poll_sent_at = now
+                            self.last_status_poll_at = now
+                        except Exception as exc:
+                            self._close_serial(str(exc))
+                if self.soft_recover_until and now >= self.soft_recover_until:
+                    reason = self.soft_recover_reason or (
+                        'receive timeout after soft recover')
+                    self._close_serial(reason, notify=True, force_notify=True)
+                elif (now - self.last_serial_rx > self.args.connection_timeout and
+                      not self.soft_recover_until):
+                    self._begin_soft_recover(
+                        'receive timeout after heartbeat retries')
         if self.external_pending:
             expired = [wire for wire, value in self.external_pending.items()
                        if value.get('deadline', 0.0) <= now]
@@ -1085,13 +1200,18 @@ class TransportDaemon(object):
                     reads.append(self.client)
                     if self.client_tx:
                         writes.append(self.client)
+                select_timeout = 0.25
                 if self.serial is not None:
                     reads.append(self.serial.fileno())
                     if self.serial_tx:
-                        writes.append(self.serial.fileno())
+                        if self._serial_can_tx(now):
+                            writes.append(self.serial.fileno())
+                        else:
+                            # Wake soon to retry after reply window / bus idle.
+                            select_timeout = min(select_timeout, 0.005)
                 try:
                     readable, writable, _errors = select.select(
-                        reads, writes, [], 0.25)
+                        reads, writes, [], select_timeout)
                 except InterruptedError:
                     continue
                 for item in readable:
@@ -1147,7 +1267,15 @@ def parse_args():
     parser.add_argument('--connection-timeout', type=float, default=15.0)
     parser.add_argument('--reconnect', type=float, default=1.0)
     parser.add_argument('--status-interval', type=float, default=0.5)
+    parser.add_argument('--status-poll-interval', type=float, default=1.0,
+                        help='wire GET_STATUS poll period when bus/cmd idle (s); 0=off')
     parser.add_argument('--connect-settle', type=float, default=1.5)
+    parser.add_argument('--tx-turnaround-ms', type=float, default=10.0,
+                        help='post-TX quiet window for MCU immediate replies (ms)')
+    parser.add_argument('--bus-idle-ms', type=float, default=5.0,
+                        help='listen-before-talk idle time before Host TX (ms)')
+    parser.add_argument('--link-offline-grace-s', type=float, default=5.0,
+                        help='soft-recover window before notifying Klipper offline')
     parser.add_argument('--log-file', required=True)
     parser.add_argument('--status-file', required=True)
     parser.add_argument('--settings-digest', default='')
@@ -1157,6 +1285,14 @@ def parse_args():
     if args.expected_uid and (len(args.expected_uid) != 24 or
                               any(ch not in '0123456789ABCDEF' for ch in args.expected_uid)):
         parser.error('--expected-uid must be 24 hexadecimal characters')
+    if not 0.0 <= float(args.tx_turnaround_ms) <= 50.0:
+        parser.error('--tx-turnaround-ms must be between 0 and 50')
+    if not 0.0 <= float(args.bus_idle_ms) <= 50.0:
+        parser.error('--bus-idle-ms must be between 0 and 50')
+    if not 0.0 <= float(args.status_poll_interval) <= 30.0:
+        parser.error('--status-poll-interval must be between 0 and 30')
+    if not 0.0 <= float(args.link_offline_grace_s) <= 60.0:
+        parser.error('--link-offline-grace-s must be between 0 and 60')
     return args
 
 def main():

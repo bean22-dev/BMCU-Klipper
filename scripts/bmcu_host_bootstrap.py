@@ -243,7 +243,11 @@ def _transport_config(path):
         'connection_timeout': 15.0,
         'reconnect': 1.0,
         'status_interval': 1.00,
+        'status_poll_interval': 1.0,
         'connect_settle': 1.5,
+        'tx_turnaround_ms': 10.0,
+        'bus_idle_ms': 5.0,
+        'link_offline_grace_s': 5.0,
         'devices': [],
     }
     if not os.path.isfile(path) or os.path.islink(path):
@@ -272,8 +276,16 @@ def _transport_config(path):
         'bmcu', 'reconnect_interval', fallback=1.0)
     values['status_interval'] = parser.getfloat(
         'bmcu', 'sidecar_status_interval', fallback=1.00)
+    values['status_poll_interval'] = parser.getfloat(
+        'bmcu', 'status_poll_interval', fallback=1.0)
     values['connect_settle'] = parser.getfloat(
         'bmcu', 'connect_settle_time', fallback=1.5)
+    values['tx_turnaround_ms'] = parser.getfloat(
+        'bmcu', 'tx_turnaround_ms', fallback=10.0)
+    values['bus_idle_ms'] = parser.getfloat(
+        'bmcu', 'bus_idle_ms', fallback=5.0)
+    values['link_offline_grace_s'] = parser.getfloat(
+        'bmcu', 'link_offline_grace_s', fallback=5.0)
     raw = parser.get('bmcu', 'devices', fallback='')
     names = set()
     ports = {}
@@ -326,8 +338,16 @@ def _transport_config(path):
         raise BootstrapError('invalid BMCU sidecar reconnect interval')
     if not 0.05 <= values['status_interval'] <= 10.0:
         raise BootstrapError('invalid BMCU sidecar status interval')
+    if not 0.0 <= values['status_poll_interval'] <= 30.0:
+        raise BootstrapError('invalid BMCU sidecar status_poll_interval')
     if not 0.1 <= values['connect_settle'] <= 10.0:
         raise BootstrapError('invalid BMCU sidecar connect settle time')
+    if not 0.0 <= values['tx_turnaround_ms'] <= 50.0:
+        raise BootstrapError('invalid BMCU sidecar tx_turnaround_ms')
+    if not 0.0 <= values['bus_idle_ms'] <= 50.0:
+        raise BootstrapError('invalid BMCU sidecar bus_idle_ms')
+    if not 0.0 <= values['link_offline_grace_s'] <= 60.0:
+        raise BootstrapError('invalid BMCU sidecar link_offline_grace_s')
     return values
 
 def _read_transport_records(path):
@@ -544,7 +564,11 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             'connection_timeout': config['connection_timeout'],
             'reconnect': config['reconnect'],
             'status_interval': config['status_interval'],
+            'status_poll_interval': config['status_poll_interval'],
             'connect_settle': config['connect_settle'],
+            'tx_turnaround_ms': config['tx_turnaround_ms'],
+            'bus_idle_ms': config['bus_idle_ms'],
+            'link_offline_grace_s': config['link_offline_grace_s'],
             'exclude_ports': excluded_serials,
             'logfile': logfile,
         }
@@ -568,7 +592,11 @@ def ensure_transport_processes(bmcu_dir, metadata, preferred_name=None, preferre
             '--connection-timeout', str(config['connection_timeout']),
             '--reconnect', str(config['reconnect']),
             '--status-interval', str(config['status_interval']),
+            '--status-poll-interval', str(config['status_poll_interval']),
             '--connect-settle', str(config['connect_settle']),
+            '--tx-turnaround-ms', str(config['tx_turnaround_ms']),
+            '--bus-idle-ms', str(config['bus_idle_ms']),
+            '--link-offline-grace-s', str(config['link_offline_grace_s']),
             '--log-file', logfile, '--status-file', status_file,
             '--settings-digest', settings_digest,
         ]
