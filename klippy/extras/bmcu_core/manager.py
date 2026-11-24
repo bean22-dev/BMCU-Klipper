@@ -8338,59 +8338,25 @@ class BMCUManager(object):
         if not arrival_evidence.get('sensor_triggered'):
             raise BMCUError(
                 'U1_LOAD_PRESSURE_NOT_READY: no Head entry-sensor confirmation')
-        target_pct = self._u1_load_pressure_pct(device)
         try:
-            timeout_s = max(5.0, float(configured_timeout))
-        except (TypeError, ValueError, OverflowError):
-            timeout_s = 45.0
-        if not math.isfinite(timeout_s):
-            timeout_s = 45.0
-        timeout_s = min(120.0, timeout_s)
-        deadline = self.reactor.monotonic() + timeout_s
-        next_poll = 0.0
-        buffer_pct = -1
-        motion = -1
-        # BMCU is already in BEFORE_ON_USE (push/hold). Do not extrude yet:
-        # wait until buffer builds to the load pressure target, then bite/capture.
-        logging.info(
-            'BMCU Snapmaker %s waiting for pre-bite pressure hold: '
-            'target=%.0f%% timeout=%.1fs (extruder idle)',
-            endpoint.name, target_pct, timeout_s)
-        while True:
-            try:
-                buffer_pct = int(device.status['buffer_pct'][channel])
-                motion = int(device.status['motion'][channel])
-            except (TypeError, ValueError, KeyError, IndexError):
-                buffer_pct = -1
-                motion = -1
-            if buffer_pct >= int(round(target_pct)):
-                break
-            now = self.reactor.monotonic()
-            if now >= deadline:
-                raise BMCUError(
-                    'U1_LOAD_PRESSURE_TIMEOUT: buffer stayed at %d%% '
-                    '(target %.0f%%) before toolhead bite' %
-                    (buffer_pct, target_pct))
-            if now >= next_poll:
-                try:
-                    device.send(protocol.MSG_GET_STATUS)
-                except Exception:
-                    pass
-                next_poll = now + 0.15
-            self.reactor.pause(min(deadline, now + 0.100))
+            buffer_pct = int(device.status['buffer_pct'][channel])
+            motion = int(device.status['motion'][channel])
+        except (TypeError, ValueError, KeyError, IndexError):
+            buffer_pct = -1
+            motion = -1
         evidence = {
             'arrival_motion': bool(arrival_evidence.get('sensor_triggered')),
             'arrival_contact': bool(arrival_evidence.get('controller_contact')),
             'buffer_pct': buffer_pct,
-            'configured_target_pct': target_pct,
+            'configured_target_pct': self._u1_load_pressure_pct(device),
             'motion': motion,
             'firmware_owned': True,
-            'host_waited': True,
+            'host_waited': False,
         }
         logging.info(
-            'BMCU Snapmaker %s pre-bite pressure ready: '
+            'BMCU Snapmaker %s pressure control handed to firmware: '
             'buffer=%d%% target=%.0f%% motion=%d',
-            endpoint.name, buffer_pct, target_pct, motion)
+            endpoint.name, buffer_pct, evidence['configured_target_pct'], motion)
         return evidence
 
     def _start_endpoint_arrival_operation(
